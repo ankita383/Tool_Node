@@ -1,0 +1,22 @@
+# --- Python / UV ---
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+
+# --- Environment Variables (CRITICAL) ---
+# Never upload your Groq/Tavily API keys!
+.env
+.env.local
+
+# --- LangGraph / Local State ---
+# If you use a local SQLite checkpointer, ignore the DB file
+*.sqlite
+checkpoint.json
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
