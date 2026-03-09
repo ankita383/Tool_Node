@@ -1,12 +1,13 @@
 import os
 import time
+import uvicorn
 import json
 from typing import Annotated, TypedDict, List
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
 from langchain_groq import ChatGroq
 from langchain_tavily import TavilySearch
-from langchain_exa import ExaSearchResults
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -16,107 +17,91 @@ from langgraph.checkpoint.memory import MemorySaver
 load_dotenv()
 
 class HousingResearch(BaseModel):
-    city: str = Field(description="Name of the city")
-    median_price: str = Field(description="Median housing price")
-    price_to_income_ratio: float = Field(description="Price to income ratio")
-    key_causes: List[str] = Field(description="Top causes of housing affordability crisis")
-    policy_solutions: List[str] = Field(description="Policy responses for housing affordability")
+    city: str
+    median_price: str
+    price_to_income_ratio: float
+    key_causes: List[str]
+    policy_solutions: List[str]
 
 class ResearchReport(BaseModel):
-    title: str = Field(description="Title of the research report")
-    objective: str = Field(
-        description="Purpose of the research and what the analysis aims to investigate"
-    )
-    methodology: str = Field(
-        description="Brief explanation of how the research was conducted using web search tools"
-    )
+    title: str
+    objective: str
+    methodology: str
     analysis: List[HousingResearch]
-    global_trends: str = Field(
-        description="Overall trends across all cities"
-    )
-    recommendations: List[str] = Field(
-        description="Global policy recommendations based on the analysis"
-    )
-    conclusion: str = Field(
-        description="Final summary of the research findings"
-    )
-    system_latency_ms: float = Field(
-        description="Time taken by the agent to generate the report"
-    )
+    global_trends: str
+    recommendations: List[str]
+    conclusion: str
+    system_latency_ms: float = 0.0
 
+tavily_search = TavilySearch(max_results=3)
+tools = [tavily_search]
 
-tavily_search = TavilySearch(max_results=2)
-exa_search = ExaSearchResults(
-    exa_api_key=os.getenv("EXA_API_KEY"),
-    num_results=1
-)
-tools = [tavily_search, exa_search]
-
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0,
-    max_tokens=2000
-)
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 llm_structured = llm.with_structured_output(ResearchReport)
 
-
 class ResearchState(TypedDict):
     messages: Annotated[list, add_messages]
-    start_time: float 
-
+    start_time: float
 
 def researcher_node(state: ResearchState):
-    if "start_time" not in state or state["start_time"] == 0:
+    if state.get("start_time", 0) == 0:
         state["start_time"] = time.time()
+        
+    sys_msg = SystemMessage(content=(
+        "You are a housing policy researcher. Use Tavily to find data. "
+        "Search for median prices and income ratios for the requested cities. "
+        "When you have found all the data, provide a final summary of your findings "
+        "so the formatter can create the final report. Also report the latency"
+    ))
+    response = llm_with_tools.invoke([sys_msg] + state["messages"])
+    return {"messages": [response], "start_time": state["start_time"]}
 
-    sys_msg = SystemMessage(content="""You are a housing policy researcher.
-        Use Tavily for quick stats and Exa for deeper research.
-        Analyze housing affordability for the requested cities and produce a structured report.
-    """)
-    last_msg = state["messages"][-1]
-
-    if isinstance(last_msg, ToolMessage):
-        last_msg.content = last_msg.content[:800]
-        latency = (time.time() - state["start_time"]) * 1000
-        messages = [sys_msg] + state["messages"][-2:]
-        response = llm_structured.invoke(messages)
-        response.system_latency_ms = round(latency, 2)
-        return {
-            "messages": [
-                AIMessage(content=json.dumps(response.dict(), indent=2))
-            ]
-        }
-    response = llm_with_tools.invoke([sys_msg] + state["messages"][-3:])
-    return {"messages": [response]}
+def formatter_node(state: ResearchState):
+    print("--- Generating Structured Report ---")
+    report = llm_structured.invoke(state["messages"])
+    latency = (time.time() - state["start_time"]) * 1000
+    report.system_latency_ms = round(latency, 2)
+    
+    return {"messages": [AIMessage(content=report.model_dump_json())]}
 
 
-flow = StateGraph(ResearchState)
-flow.add_node("researcher", researcher_node)
-flow.add_node("tools", ToolNode(tools))
-flow.add_edge(START, "researcher")
-flow.add_conditional_edges("researcher", tools_condition)
-flow.add_edge("tools", "researcher")
-app = flow.compile(checkpointer=MemorySaver())
+def should_continue(state: ResearchState):
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tools"
+    return "formatter"
 
-def run_research():
-    print("--- Global Housing Research Agent ---")
-    config = {"configurable": {"thread_id": "research_1"}}
-    user_query = input("Enter your research query: ")
-    print(f"\nProcessing request: {user_query}\n")
+workflow = StateGraph(ResearchState)
+
+workflow.add_node("researcher", researcher_node)
+workflow.add_node("tools", ToolNode(tools))
+workflow.add_node("formatter", formatter_node)
+workflow.add_edge(START, "researcher")
+workflow.add_conditional_edges("researcher", should_continue)
+workflow.add_edge("tools", "researcher") 
+workflow.add_edge("formatter", END)
+
+app_graph = workflow.compile(checkpointer=MemorySaver())
+
+app = FastAPI(title="Housing Agent API")
+
+class QueryRequest(BaseModel):
+    query: str
+    thread_id: str = "default_research"
+
+@app.post("/research")
+async def run_research_endpoint(request: QueryRequest):
+    config = {"configurable": {"thread_id": request.thread_id}}
     input_data = {
-        "messages": [HumanMessage(content=user_query)],
-        "start_time": 0
+        "messages": [HumanMessage(content=request.query)],
+        "start_time": time.time()
     }
+    
+    try:
+        final_state = app_graph.invoke(input_data, config)
+        return json.loads(final_state["messages"][-1].content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    for event in app.stream(input_data, config, stream_mode="values"):
-        msg = event["messages"][-1]
-        if isinstance(msg, AIMessage) and "{" in msg.content:
-            print("RESEARCH REPORT")
-            print(msg.content)
-
-        elif hasattr(msg, "tool_calls") and msg.tool_calls:
-            tool_name = msg.tool_calls[0]["name"]
-            print(f"Action: Using {tool_name} to search for housing data...")
-
-run_research()
+uvicorn.run(app, host="127.0.0.1", port=8000)
