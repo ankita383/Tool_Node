@@ -24,5 +24,4 @@ def divide(a: float, b: float) -> float:
     return a / b
 
 if __name__ == "__main__":
-    # This replaces the 'fastmcp run' command
     mcp.run(transport="sse", port=8000)
